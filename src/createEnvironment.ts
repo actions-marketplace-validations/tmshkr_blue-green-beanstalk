@@ -1,21 +1,22 @@
 import {
   ApplicationVersionDescription,
   CreateEnvironmentCommand,
-  ElasticBeanstalkClient,
   ListPlatformVersionsCommand,
   waitUntilEnvironmentExists,
 } from "@aws-sdk/client-elastic-beanstalk";
 
+import { ebClient } from "./clients";
 import { ActionInputs } from "./inputs";
-import { defaultOptionSettings } from "./config/defaultOptionSettings";
 import { getEnvironments } from "./getEnvironments";
 import { setDescribeEventsInterval } from "./setDescribeEventsInterval";
 
-async function getPlatformArn(
-  client: ElasticBeanstalkClient,
-  platformBranchName: string
-) {
-  const { PlatformSummaryList } = await client.send(
+async function getPlatformArn(platformBranchName: string) {
+  if (!platformBranchName) {
+    throw new Error(
+      "platform_branch_name must be provided when creating a new environment"
+    );
+  }
+  const { PlatformSummaryList } = await ebClient.send(
     new ListPlatformVersionsCommand({
       Filters: [
         {
@@ -31,38 +32,91 @@ async function getPlatformArn(
 }
 
 export async function createEnvironment(
-  client: ElasticBeanstalkClient,
   inputs: ActionInputs,
-  applicationVersion: ApplicationVersionDescription
+  applicationVersion?: ApplicationVersionDescription
 ) {
-  const { prodEnv } = await getEnvironments(client, inputs);
+  const { prodEnv, stagingEnv, singleEnv } = await getEnvironments(inputs);
+  if (stagingEnv) {
+    console.error("Staging environment already exists:", stagingEnv);
+    throw new Error("Cannot create staging environment.");
+  }
+  if (singleEnv) {
+    console.error("Environment already exists:", singleEnv);
+    throw new Error("Cannot create environment.");
+  }
+  const defaultOptionSettings = [
+    {
+      Namespace: "aws:ec2:instances",
+      OptionName: "InstanceTypes",
+      Value: "t3.micro,t2.micro",
+    },
+    {
+      Namespace: "aws:elasticbeanstalk:environment",
+      OptionName: "EnvironmentType",
+      Value: "SingleInstance",
+    },
+    {
+      Namespace: "aws:elasticbeanstalk:environment",
+      OptionName: "ServiceRole",
+      Value: "service-role/aws-elasticbeanstalk-service-role",
+    },
+    {
+      Namespace: "aws:autoscaling:launchconfiguration",
+      OptionName: "DisableIMDSv1",
+      Value: true,
+    },
+    {
+      Namespace: "aws:autoscaling:launchconfiguration",
+      OptionName: "IamInstanceProfile",
+      Value: "aws-elasticbeanstalk-ec2-role",
+    },
+  ];
 
   const startTime = new Date();
-  const newEnv = await client.send(
+  const newEnv = await ebClient.send(
     new CreateEnvironmentCommand({
-      ApplicationName: applicationVersion.ApplicationName,
-      TemplateName: inputs.templateName,
+      ApplicationName: inputs.app_name,
+      CNAMEPrefix:
+        inputs.single_env_cname ??
+        (prodEnv ? inputs.staging_cname : inputs.production_cname),
       EnvironmentName:
-        prodEnv?.EnvironmentName === inputs.blueEnv
-          ? inputs.greenEnv
-          : inputs.blueEnv,
-      CNAMEPrefix: prodEnv ? inputs.stagingCNAME : inputs.productionCNAME,
-      PlatformArn: await getPlatformArn(client, inputs.platformBranchName),
-      OptionSettings: inputs.templateName ? undefined : defaultOptionSettings,
-      VersionLabel: applicationVersion.VersionLabel,
+        inputs.single_env ??
+        (prodEnv?.EnvironmentName === inputs.blue_env
+          ? inputs.green_env
+          : inputs.blue_env),
+      OptionSettings:
+        inputs.option_settings ??
+        (inputs.use_default_option_settings
+          ? defaultOptionSettings
+          : undefined),
+      PlatformArn: await getPlatformArn(inputs.platform_branch_name),
+      TemplateName: inputs.template_name,
+      VersionLabel: applicationVersion?.VersionLabel,
     })
   );
+
   console.log(
     `Creating environment ${newEnv.EnvironmentId} ${newEnv.EnvironmentName}...`
   );
 
-  const interval = setDescribeEventsInterval(
-    client,
-    newEnv.EnvironmentId,
-    startTime
-  );
+  if (!inputs.wait_for_deployment) {
+    return newEnv;
+  }
+
+  const ac = new AbortController();
+  const interval = setDescribeEventsInterval({
+    environment: newEnv,
+    inputs,
+    startTime,
+  });
   await waitUntilEnvironmentExists(
-    { client, maxWaitTime: 60 * 10, minDelay: 5, maxDelay: 30 },
+    {
+      client: ebClient,
+      maxWaitTime: 60 * 10,
+      minDelay: 5,
+      maxDelay: 30,
+      abortSignal: ac.signal,
+    },
     { EnvironmentIds: [newEnv.EnvironmentId] }
   );
   clearInterval(interval);

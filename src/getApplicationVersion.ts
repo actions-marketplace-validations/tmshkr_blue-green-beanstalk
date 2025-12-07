@@ -1,61 +1,67 @@
 import {
+  CreateApplicationCommand,
   CreateApplicationVersionCommand,
   CreateStorageLocationCommand,
   DescribeApplicationVersionsCommand,
-  ElasticBeanstalkClient,
 } from "@aws-sdk/client-elastic-beanstalk";
-import {
-  S3Client,
-  PutObjectCommand,
-  HeadObjectCommand,
-} from "@aws-sdk/client-s3";
-const fs = require("fs");
+import { PutObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { readFileSync } from "fs";
 
-import { ActionInputs, getCredentials } from "./inputs";
+import { ebClient, s3Client } from "./clients";
+import { ActionInputs } from "./inputs";
 
-export async function getApplicationVersion(
-  client: ElasticBeanstalkClient,
-  inputs: ActionInputs
-) {
-  const { ApplicationVersions } = await client.send(
+export async function getApplicationVersion(inputs: ActionInputs) {
+  if (!inputs.version_label) {
+    await ebClient
+      .send(new CreateApplicationCommand({ ApplicationName: inputs.app_name }))
+      .catch((error) => {
+        if (
+          error.name === "InvalidParameterValue" &&
+          error.message.includes("already exists")
+        ) {
+          console.log(`Application ${inputs.app_name} already exists.`);
+        } else throw error;
+      });
+    return null;
+  }
+
+  const { ApplicationVersions } = await ebClient.send(
     new DescribeApplicationVersionsCommand({
-      ApplicationName: inputs.appName,
-      VersionLabels: [inputs.versionLabel],
+      ApplicationName: inputs.app_name,
+      VersionLabels: [inputs.version_label],
     })
   );
+  // .catch((error) => {});
 
   if (ApplicationVersions.length > 0) {
-    console.log(`Application version ${inputs.versionLabel} already exists.`);
+    console.log(`Application version ${inputs.version_label} already exists.`);
     return ApplicationVersions[0];
   }
 
-  const newVersion = await createApplicationVersion(client, inputs);
-  return newVersion;
+  return await createApplicationVersion(inputs);
 }
 
-async function createApplicationVersion(
-  client: ElasticBeanstalkClient,
-  inputs: ActionInputs
-) {
+function encodeRFC3986URIComponent(str: string) {
+  return encodeURIComponent(str).replace(
+    /[!'()*]/g,
+    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`
+  );
+}
+
+async function createApplicationVersion(inputs: ActionInputs) {
   let SourceBundle;
 
-  if (inputs.sourceBundlePath) {
-    const { S3Bucket } = await client.send(
+  if (inputs.source_bundle) {
+    const { S3Bucket } = await ebClient.send(
       new CreateStorageLocationCommand({})
     );
-    const S3Key = `${inputs.appName}/${inputs.versionLabel.replace(
-      /[^a-zA-Z0-9-_]/g,
-      "-"
-    )}.zip`;
+    const S3Key = `${inputs.app_name}/${encodeRFC3986URIComponent(
+      inputs.version_label
+    )}.${inputs.source_bundle.split(".").pop()}`;
 
     SourceBundle = { S3Bucket, S3Key };
 
-    const s3 = new S3Client({
-      region: inputs.awsRegion,
-      credentials: getCredentials(),
-    });
-
-    const fileExists = await s3
+    const fileExists = await s3Client
       .send(
         new HeadObjectCommand({
           Bucket: S3Bucket,
@@ -72,22 +78,23 @@ async function createApplicationVersion(
 
     if (!fileExists) {
       console.log(`Uploading ${S3Key} to S3...`);
-      await s3.send(
+      await s3Client.send(
         new PutObjectCommand({
           Bucket: S3Bucket,
           Key: S3Key,
-          Body: fs.readFileSync(inputs.sourceBundlePath),
+          Body: readFileSync(inputs.source_bundle),
         })
       );
     }
   }
 
-  const { ApplicationVersion } = await client.send(
+  const { ApplicationVersion } = await ebClient.send(
     new CreateApplicationVersionCommand({
-      ApplicationName: inputs.appName,
+      ApplicationName: inputs.app_name,
       AutoCreateApplication: true,
-      VersionLabel: inputs.versionLabel,
+      Description: inputs.version_description,
       SourceBundle,
+      VersionLabel: inputs.version_label,
     })
   );
 

@@ -1,0 +1,14 @@
+name: Update tags
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/update-tags.sh

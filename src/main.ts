@@ -1,49 +1,72 @@
-import { ElasticBeanstalkClient } from "@aws-sdk/client-elastic-beanstalk";
-import * as core from "@actions/core";
+import {
+  EnvironmentDescription,
+  DescribeEnvironmentsCommand,
+} from "@aws-sdk/client-elastic-beanstalk";
+import { setFailed, setOutput } from "@actions/core";
 
+import { ebClient } from "./clients";
 import { getApplicationVersion } from "./getApplicationVersion";
 import { getTargetEnv } from "./getTargetEnv";
 import { createEnvironment } from "./createEnvironment";
-import { deploy } from "./deploy";
-import { swapCNAMES } from "./swapCNAMES";
-import { ActionInputs, getCredentials } from "./inputs";
-
-function checkInputs(inputs: ActionInputs) {
-  if (inputs.blueEnv === inputs.greenEnv) {
-    throw new Error("blue_env and green_env must be different");
-  }
-
-  if (inputs.productionCNAME === inputs.stagingCNAME) {
-    throw new Error("production_cname and staging_cname must be different");
-  }
-}
+import { updateEnvironment } from "./updateEnvironment";
+import { swapCNAMEs } from "./swapCNAMEs";
+import { ActionInputs } from "./inputs";
+import { enableTerminationProtection } from "./updateTerminationProtection";
+import { sendCommand } from "./sendCommand";
+import { updateTargetGroups } from "./updateListenerRules";
 
 export async function main(inputs: ActionInputs) {
+  let targetEnv: EnvironmentDescription | null = null;
   try {
-    checkInputs(inputs);
+    const applicationVersion = await getApplicationVersion(inputs);
+    targetEnv = await getTargetEnv(inputs);
+
+    if (inputs.deploy) {
+      if (targetEnv && inputs.update_environment) {
+        await updateEnvironment(inputs, targetEnv, applicationVersion);
+      } else if (!targetEnv && inputs.create_environment) {
+        targetEnv = await createEnvironment(inputs, applicationVersion);
+      }
+    }
+
+    if (inputs.enable_termination_protection) {
+      await enableTerminationProtection(targetEnv);
+    }
+
+    if (inputs.send_command) {
+      await sendCommand(inputs, targetEnv);
+    }
+
+    if (inputs.swap_cnames) {
+      await swapCNAMEs(inputs);
+    }
+
+    if (inputs.update_listener_rules) {
+      await updateTargetGroups(inputs);
+    }
   } catch (err) {
-    core.setFailed(err.message);
+    setFailed(err.message);
     return Promise.reject(err);
   }
 
-  const client = new ElasticBeanstalkClient({
-    region: inputs.awsRegion,
-    credentials: getCredentials(),
-  });
+  await setOutputs(targetEnv);
+}
 
-  const applicationVersion = await getApplicationVersion(client, inputs);
-  let targetEnv = await getTargetEnv(client, inputs);
-
-  if (inputs.deploy) {
-    if (targetEnv) {
-      await deploy(client, targetEnv, applicationVersion);
-    } else {
-      targetEnv = await createEnvironment(client, inputs, applicationVersion);
-    }
-    if (inputs.swapCNAMES) {
-      await swapCNAMES(client, inputs);
-    }
+export async function setOutputs(targetEnv: EnvironmentDescription) {
+  if (targetEnv) {
+    targetEnv = await ebClient
+      .send(
+        new DescribeEnvironmentsCommand({
+          EnvironmentIds: [targetEnv.EnvironmentId],
+        })
+      )
+      .then(({ Environments }) => Environments[0]);
   }
 
-  core.setOutput("target_env", targetEnv?.EnvironmentName || "");
+  setOutput("target_env_cname", targetEnv?.CNAME || "");
+  setOutput("target_env_endpoint_url", targetEnv?.EndpointURL || "");
+  setOutput("target_env_id", targetEnv?.EnvironmentId || "");
+  setOutput("target_env_json", JSON.stringify(targetEnv) || "");
+  setOutput("target_env_name", targetEnv?.EnvironmentName || "");
+  setOutput("target_env_status", targetEnv?.Status || "");
 }
